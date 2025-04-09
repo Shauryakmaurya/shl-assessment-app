@@ -1,64 +1,60 @@
 import streamlit as st
+import pandas as pd
 from Hybrid_Rag_Ui_Table import hybrid_search, call_llama, format_table
 import re
 import requests
+from io import StringIO
 
-# --- Optional: Pull secret from Streamlit Cloud ---
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
-
-# Override in case running locally
-if not GROQ_API_KEY:
-    from Hybrid_Rag_Ui_Table import GROQ_API_KEY as fallback
-    GROQ_API_KEY = fallback
-
-# Use updated Groq API key
-def call_llama_updated(prompt):
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "llama3-8b-8192",
-        "messages": [
-            {"role": "system", "content": "You are an SHL test recommender. Suggest suitable assessments based on user input."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-    response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data)
-    return response.json()["choices"][0]["message"]["content"]
-
-# Optional: Pull page content if URL is in query
-def extract_url_content(query):
-    url_match = re.search(r'https?://\S+', query)
-    if url_match:
-        try:
-            page = requests.get(url_match.group(0), timeout=5)
-            return page.text[:3000]  # Keep it concise
-        except:
-            return ""
-    return ""
-
-# --- Streamlit UI ---
+# Load and configure
 st.set_page_config(page_title="SHL Assessment Recommender", layout="wide")
 st.title("🧠 SHL Assessment Recommender (Hybrid RAG + LLaMA)")
 
-query = st.text_area("✍️ Enter a Job Description or Assessment Query (or a Link to a JD)", height=200)
+# Query input
+query = st.text_area("✍️ Enter Job Description, Query or JD Link", height=200)
 
+# Filter options
+col1, col2, col3 = st.columns(3)
+max_duration = col1.slider("⏱️ Max Duration (min)", min_value=0, max_value=120, value=60)
+remote_only = col2.checkbox("🌐 Only show Remote Tests")
+adaptive_only = col3.checkbox("🧠 Only show Adaptive/IRT Tests")
+search_filter = st.text_input("🔎 Filter Results by Keyword (optional)")
+
+# Action button
 if st.button("🔍 Recommend Assessments") and query:
-    with st.spinner("Running Hybrid Search and LLaMA recommendation..."):
-        url_content = extract_url_content(query)
-        if url_content:
-            query += f"\n\n[Extracted from link]:\n{url_content}"
+    with st.spinner("Running Hybrid Search and LLaMA..."):
+        # Optional: extract content from URL if provided
+        url_match = re.search(r'https?://\S+', query)
+        if url_match:
+            try:
+                page = requests.get(url_match.group(0), timeout=5)
+                query += f"\n\n[Page snippet]:\n{page.text[:3000]}"
+            except:
+                st.warning("Could not fetch content from URL")
 
+        # Hybrid search
         top_meta, top_docs = hybrid_search(query)
-        table = format_table(top_meta)
+        df = format_table(top_meta)
 
-        st.subheader("🔝 Top Matching Assessments")
-        st.text(table)
+        # Apply filters
+        df = df[df["Duration (min)"].apply(lambda x: int(x) if str(x).isdigit() else 999) <= max_duration]
+        if remote_only:
+            df = df[df["Remote"] == "✅"]
+        if adaptive_only:
+            df = df[df["Adaptive/IRT"] == "✅"]
+        if search_filter:
+            df = df[df.apply(lambda row: search_filter.lower() in row.astype(str).str.lower().str.cat(), axis=1)]
 
+        st.subheader("🔝 Filtered Matching Assessments")
+        st.dataframe(df, use_container_width=True)
+
+        # Download button
+        csv = df.to_csv(index=False)
+        st.download_button("⬇️ Download Results as CSV", data=csv, file_name="recommended_assessments.csv", mime="text/csv")
+
+        # LLaMA final recommendation
         context = "\n\n".join(top_docs)
         prompt = f"Here is the context of available SHL tests:\n\n{context}\n\nBased on this, suggest the most relevant assessments for the following job description or query:\n{query}"
-        response = call_llama_updated(prompt)
+        response = call_llama(prompt)
 
         st.subheader("💡 LLaMA Recommendation")
         st.write(response)
